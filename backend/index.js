@@ -1,81 +1,113 @@
 const express = require('express');
 const fs = require('fs');
 const csv = require('csv-parser');
+const { Pool } = require('pg');
 const Heap = require('heap');
-const sqlite3 = require('sqlite3').verbose();
 
 const app = express();
 app.use(express.json());
 app.use(express.static('public'));
 
-// In-memory SQLite database
-const db = new sqlite3.Database(':memory:');
+// PostgreSQL connection pool
+const pool = new Pool({
+    user: process.env.POSTGRES_USER || 'postgres',
+    host: process.env.POSTGRES_HOST || 'db',
+    database: process.env.POSTGRES_DB || 'mydatabase',
+    password: process.env.POSTGRES_PASSWORD || 'postgres',
+    port: process.env.POSTGRES_PORT || 5432,
+});
 
 // In-memory data structures
 let banks = {};
 let graph = {};
 
 // Initialize database tables
-function initializeDatabase() {
-    return new Promise((resolve, reject) => {
-        db.serialize(() => {
-            db.run('CREATE TABLE banks (BIC TEXT PRIMARY KEY, Charge REAL)', (err) => {
-                if (err) reject(err);
-            });
-            db.run('CREATE TABLE links (FromBIC TEXT, ToBIC TEXT, TimeTakenInMinutes INTEGER)', (err) => {
-                if (err) reject(err);
-            });
-        });
-        resolve();
-    });
+async function initializeDatabase() {
+    try {
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS banks (
+                BIC TEXT PRIMARY KEY,
+                Charge REAL
+            );
+        `);
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS links (
+                FromBIC TEXT,
+                ToBIC TEXT,
+                TimeTakenInMinutes INTEGER
+            );
+        `);
+    } catch (error) {
+        console.error("Database initialization error:", error);
+    }
 }
 
 // Load data from CSV files into the database
 async function loadDataToDatabase() {
+    const banksData = [];
+    const linksData = [];
+
+    // Read banks CSV
     await new Promise((resolve, reject) => {
         fs.createReadStream('banks.csv')
             .pipe(csv())
             .on('data', (row) => {
-                db.run('INSERT INTO banks (BIC, Charge) VALUES (?, ?)', [row.BIC, parseFloat(row.Charge)]);
+                banksData.push([row.BIC, parseFloat(row.Charge)]);
             })
             .on('end', resolve)
             .on('error', reject);
     });
 
+    // Read links CSV
     await new Promise((resolve, reject) => {
         fs.createReadStream('links.csv')
             .pipe(csv())
             .on('data', (row) => {
-                db.run('INSERT INTO links (FromBIC, ToBIC, TimeTakenInMinutes) VALUES (?, ?, ?)', 
-                    [row.FromBIC, row.ToBIC, parseInt(row.TimeTakenInMinutes)]);
+                linksData.push([row.FromBIC, row.ToBIC, parseInt(row.TimeTakenInMinutes)]);
             })
             .on('end', resolve)
             .on('error', reject);
     });
+
+    // Insert data into PostgreSQL
+    try {
+        await pool.query('DELETE FROM banks');
+        await pool.query('DELETE FROM links');
+
+        const bankQuery = `INSERT INTO banks (BIC, Charge) VALUES ($1, $2)`;
+        for (let bank of banksData) {
+            await pool.query(bankQuery, bank);
+        }
+
+        const linkQuery = `INSERT INTO links (FromBIC, ToBIC, TimeTakenInMinutes) VALUES ($1, $2, $3)`;
+        for (let link of linksData) {
+            await pool.query(linkQuery, link);
+        }
+
+        console.log("Data successfully loaded into PostgreSQL");
+    } catch (error) {
+        console.error("Error inserting data:", error);
+    }
 }
 
 // Load data from database into memory
 async function loadDataToMemory() {
-    await new Promise((resolve, reject) => {
-        db.all('SELECT * FROM banks', (err, rows) => {
-            if (err) reject(err);
-            rows.forEach(row => {
-                banks[row.BIC] = row.Charge;
-            });
-            resolve();
+    try {
+        const banksRes = await pool.query('SELECT * FROM banks');
+        banksRes.rows.forEach(row => {
+            banks[row.bic] = row.charge;
         });
-    });
 
-    await new Promise((resolve, reject) => {
-        db.all('SELECT * FROM links', (err, rows) => {
-            if (err) reject(err);
-            rows.forEach(row => {
-                if (!graph[row.FromBIC]) graph[row.FromBIC] = [];
-                graph[row.FromBIC].push({ to: row.ToBIC, time: row.TimeTakenInMinutes });
-            });
-            resolve();
+        const linksRes = await pool.query('SELECT * FROM links');
+        linksRes.rows.forEach(row => {
+            if (!graph[row.frombic]) graph[row.frombic] = [];
+            graph[row.frombic].push({ to: row.tobic, time: row.timetakeninminutes });
         });
-    });
+
+        console.log("Data successfully loaded into memory");
+    } catch (error) {
+        console.error("Error loading data into memory:", error);
+    }
 }
 
 // Dijkstra's algorithm for fastest path (minimizing time)
@@ -151,7 +183,7 @@ function dijkstraCheapest(start, end) {
 }
 
 // API endpoint for fastest route
-app.post('/api/fastestroute', (req, res) => {
+app.post('/api/fastestroute', async (req, res) => {
     const { fromBank, toBank } = req.body;
     if (!banks[fromBank] || !banks[toBank]) {
         return res.status(400).json({ error: 'Invalid bank BIC' });
@@ -160,12 +192,11 @@ app.post('/api/fastestroute', (req, res) => {
     if (!result) {
         return res.status(404).json({ error: 'No path found' });
     }
-    const route = result.path.join(' -> ');
-    res.json({ route, time: result.time });
+    res.json({ route: result.path.join(' -> '), time: result.time });
 });
 
 // API endpoint for cheapest route
-app.post('/api/cheapestroute', (req, res) => {
+app.post('/api/cheapestroute', async (req, res) => {
     const { fromBank, toBank } = req.body;
     if (!banks[fromBank] || !banks[toBank]) {
         return res.status(400).json({ error: 'Invalid bank BIC' });
@@ -174,8 +205,7 @@ app.post('/api/cheapestroute', (req, res) => {
     if (!result) {
         return res.status(404).json({ error: 'No path found' });
     }
-    const route = result.path.join(' -> ');
-    res.json({ route, cost: result.cost });
+    res.json({ route: result.path.join(' -> '), cost: result.cost });
 });
 
 // Start the server
@@ -184,8 +214,8 @@ async function startServer() {
         await initializeDatabase();
         await loadDataToDatabase();
         await loadDataToMemory();
-        app.listen(3000, () => {
-            console.log('Server started on port 3000');
+        app.listen(8000, () => {
+            console.log('Server started on port 8000');
         });
     } catch (err) {
         console.error('Error starting server:', err);
