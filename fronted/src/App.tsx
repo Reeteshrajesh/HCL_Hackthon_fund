@@ -105,8 +105,8 @@ const banks = [
 
 // API endpoints
 const API_ENDPOINTS = {
-  fastest: "http://localhost:3000/api/fastestroute",
-  cheapest: "http://localhost:3000/api/cheapestroute",
+  fastest: "http://localhost:8000/api/fastestroute",
+  cheapest: "http://localhost:8000/api/cheapestroute",
 };
 
 interface PathResponse {
